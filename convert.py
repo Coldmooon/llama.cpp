@@ -636,6 +636,264 @@ class LlamaHfVocab(Vocab):
         return f"<LlamaHfVocab with {self.vocab_size_base} base tokens and {len(self.added_tokens_list)} added tokens>"
 
 
+# import gguf  # Assuming gguf is already in the scope
+import tiktoken
+from tiktoken.load import load_tiktoken_bpe
+
+from logging import getLogger
+from typing import (
+    AbstractSet,
+    cast,
+    Collection,
+    Dict,
+    Iterator,
+    List,
+    Sequence,
+    Union,
+)
+
+logger = getLogger(__name__)
+
+class MetaLLAMA3Tokenizer:
+    """
+    Tokenizing and encoding/decoding text using the Tiktoken tokenizer.
+    """
+
+    special_tokens: Dict[str, int]
+
+    num_reserved_special_tokens = 256
+
+    pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
+
+    def __init__(self, model_path: str):
+        """
+        Initializes the Tokenizer with a Tiktoken model.
+
+        Args:
+            model_path (str): The path to the Tiktoken model file.
+        """
+        assert os.path.isfile(model_path), model_path
+
+        mergeable_ranks = load_tiktoken_bpe(model_path)
+        num_base_tokens = len(mergeable_ranks)
+        special_tokens = [
+            "<|begin_of_text|>",
+            "<|end_of_text|>",
+            "<|reserved_special_token_0|>",
+            "<|reserved_special_token_1|>",
+            "<|reserved_special_token_2|>",
+            "<|reserved_special_token_3|>",
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|reserved_special_token_4|>",
+            "<|eot_id|>",  # end of turn
+        ] + [
+            f"<|reserved_special_token_{i}|>"
+            for i in range(5, self.num_reserved_special_tokens - 5)
+        ]
+        self.special_tokens = {
+            token: num_base_tokens + i for i, token in enumerate(special_tokens)
+        }
+        self.model = tiktoken.Encoding(
+            name=Path(model_path).name,
+            pat_str=self.pat_str,
+            mergeable_ranks=mergeable_ranks,
+            special_tokens=self.special_tokens,
+        )
+        logger.info(f"Reloaded tiktoken model from {model_path}")
+
+        self.n_words: int = self.model.n_vocab
+        # BOS / EOS token IDs
+        self.bos_id: int = self.special_tokens["<|begin_of_text|>"]
+        self.eos_id: int = self.special_tokens["<|end_of_text|>"]
+        self.pad_id: int = -1
+        self.stop_tokens = {
+            self.special_tokens["<|end_of_text|>"],
+            self.special_tokens["<|eot_id|>"],
+        }
+        logger.info(
+            f"#words: {self.n_words} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id}"
+        )
+
+    def encode(
+        self,
+        s: str,
+        *,
+        bos: bool,
+        eos: bool,
+        allowed_special: Union[Literal["all"], AbstractSet[str]] = set(),
+        disallowed_special: Union[Literal["all"], Collection[str]] = (),
+    ) -> List[int]:
+        """
+        Encodes a string into a list of token IDs.
+
+        Args:
+            s (str): The input string to be encoded.
+            bos (bool): Whether to prepend the beginning-of-sequence token.
+            eos (bool): Whether to append the end-of-sequence token.
+            allowed_tokens ("all"|set[str]): allowed special tokens in string
+            disallowed_tokens ("all"|set[str]): special tokens that raise an error when in string
+
+        Returns:
+            list[int]: A list of token IDs.
+
+        By default, setting disallowed_special=() encodes a string by ignoring
+        special tokens. Specifically:
+        - Setting `disallowed_special` to () will cause all text corresponding
+          to special tokens to be encoded as natural text (insteading of raising
+          an error).
+        - Setting `allowed_special` to "all" will treat all text corresponding
+          to special tokens to be encoded as special tokens.
+        """
+        assert type(s) is str
+
+        # The tiktoken tokenizer can handle <=400k chars without
+        # pyo3_runtime.PanicException.
+        TIKTOKEN_MAX_ENCODE_CHARS = 400_000
+
+        # https://github.com/openai/tiktoken/issues/195
+        # Here we iterate over subsequences and split if we exceed the limit
+        # of max consecutive non-whitespace or whitespace characters.
+        MAX_NO_WHITESPACES_CHARS = 25_000
+
+        substrs = (
+            substr
+            for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
+            for substr in self._split_whitespaces_or_nonwhitespaces(
+                s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
+            )
+        )
+        t: List[int] = []
+        for substr in substrs:
+            t.extend(
+                self.model.encode(
+                    substr,
+                    allowed_special=allowed_special,
+                    disallowed_special=disallowed_special,
+                )
+            )
+        if bos:
+            t.insert(0, self.bos_id)
+        if eos:
+            t.append(self.eos_id)
+        return t
+
+    def decode(self, t: Sequence[int]) -> str:
+        """
+        Decodes a list of token IDs into a string.
+
+        Args:
+            t (List[int]): The list of token IDs to be decoded.
+
+        Returns:
+            str: The decoded string.
+        """
+        # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
+        return self.model.decode(cast(List[int], t))
+
+    @staticmethod
+    def _split_whitespaces_or_nonwhitespaces(
+        s: str, max_consecutive_slice_len: int
+    ) -> Iterator[str]:
+        """
+        Splits the string `s` so that each substring contains no more than `max_consecutive_slice_len`
+        consecutive whitespaces or consecutive non-whitespaces.
+        """
+        current_slice_len = 0
+        current_slice_is_space = s[0].isspace() if len(s) > 0 else False
+        slice_start = 0
+
+        for i in range(len(s)):
+            is_now_space = s[i].isspace()
+
+            if current_slice_is_space ^ is_now_space:
+                current_slice_len = 1
+                current_slice_is_space = is_now_space
+            else:
+                current_slice_len += 1
+                if current_slice_len > max_consecutive_slice_len:
+                    yield s[slice_start:i]
+                    slice_start = i
+                    current_slice_len = 1
+        yield s[slice_start:]
+
+
+class Llama3Vocab(Vocab):
+    tokenizer_model = "llama3"
+    name = "llama3"
+
+    def __init__(self, base_path: Path):      
+        self.fname_tokenizer = base_path / "tokenizer.model"
+        print('tokenizer path: ', self.fname_tokenizer)
+        if not self.fname_tokenizer.exists():
+            raise FileNotFoundError(f"Tokenizer model not found at {self.fname_tokenizer}")
+
+        # Initialize the tokenizer from the file
+        self.tokenizer = MetaLLAMA3Tokenizer(str(self.fname_tokenizer))
+        # Access the protected member if it's the correct one after confirmation
+        print('len(self.tokenizer.special_tokens): ', len(self.tokenizer.special_tokens))
+        self.vocab_size = len(self.tokenizer.model._mergeable_ranks) + len(self.tokenizer.special_tokens)
+
+
+    # def all_tokens(self) -> Iterable[Tuple[bytes, float, gguf.TokenType]]:
+    #     # Yield base tokens with their types and scores (assuming score 0.0 for simplicity)
+    #     base_tokens = self.tokenizer.model._mergeable_ranks.keys()  # Adjust as necessary if the method to access tokens differs
+    #     for token in base_tokens:
+    #         yield token.encode('utf-8'), 0.0, gguf.TokenType.NORMAL
+        
+    #     # Yield special tokens
+    #     for token, index in self.tokenizer.special_tokens.items():
+    #         yield token.encode('utf-8'), 0.0, gguf.TokenType.SPECIAL
+
+    def all_tokens(self) -> Iterable[Tuple[bytes, float, gguf.TokenType]]:
+        # Assuming base_tokens are already in bytes format
+        base_tokens = self.tokenizer.model._mergeable_ranks.keys()  # Adjust if the method to access tokens differs
+        for token in base_tokens:
+            yield token, 0.0, gguf.TokenType.NORMAL  # No need to encode
+        
+        # Yield special tokens, assuming they are also in bytes format
+        for token, index in self.tokenizer.special_tokens.items():
+            token_type = gguf.TokenType.CONTROL  # Use CONTROL or another appropriate enum member
+            yield token.encode('utf-8') if isinstance(token, str) else token, 0.0, token_type
+
+    def __repr__(self) -> str:
+        return f"<Llama3Vocab with {self.vocab_size} tokens from {self.fname_tokenizer}>"
+
+    # def encode(self, text: str, bos: bool = False, eos: bool = False) -> List[int]:
+    #     return self.tokenizer.encode(text, bos=bos, eos=eos)
+
+    def encode(self, text: str, bos: bool = True, eos: bool = True) -> list[int]:
+        """
+        Encodes a string into a list of token IDs, with options to add BOS and EOS tokens.
+
+        Args:
+            text (str): Text to encode.
+            bos (bool): If True, prepend the beginning-of-sequence token.
+            eos (bool): If True, append the end-of-sequence token.
+
+        Returns:
+            list[int]: A list of token IDs.
+        """
+        token_ids = self.tokenizer.encode(text, bos=bos, eos=eos, allowed_special="all", disallowed_special=())
+        return token_ids
+
+
+    def decode(self, token_ids: List[int]) -> str:
+
+        """
+        Decodes a list of token IDs back into a string.
+
+        Args:
+            token_ids (list[int]): List of token IDs to decode.
+
+        Returns:
+            str: The decoded string.
+        """
+        return self.tokenizer.decode(token_ids)
+    
+
+
+
 #
 # data loading
 # TODO: reuse (probably move to gguf.py?)
@@ -1380,7 +1638,7 @@ def load_some_model(path: Path) -> ModelPlus:
 
 
 class VocabFactory:
-    _VOCAB_CLASSES: list[type[Vocab]] = [SentencePieceVocab, BpeVocab, LlamaHfVocab]
+    _VOCAB_CLASSES: list[type[Vocab]] = [SentencePieceVocab, BpeVocab, LlamaHfVocab, Llama3Vocab]
 
     def __init__(self, path: Path):
         self.path = path
